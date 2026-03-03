@@ -18,16 +18,24 @@ using NinjaTrader.NinjaScript;
 using NinjaTrader.Core.FloatingPoint;
 using NinjaTrader.NinjaScript.DrawingTools;
 using NinjaTrader.NinjaScript.Indicators;
+using System.IO;
 #endregion
 
 namespace NinjaTrader.NinjaScript.Indicators
 {
 	public class DeltaFlip_AG : Indicator
 	{
-		private OrderFlowCumulativeDelta cumulativeDelta;
 		private Series<double> barDelta;
+		private Series<double> barMaxDelta;
+		private Series<double> barMinDelta;
+		
+		private double currentDelta = 0;
+		private double currentMaxDelta = 0;
+		private double currentMinDelta = 0;
 		private int consecutivePositive = 0;
 		private int consecutiveNegative = 0;
+		private string filePath;
+		private bool headerWritten = false;
 
 		protected override void OnStateChange()
 		{
@@ -35,7 +43,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 			{
 				Description					= "Identificador de reversión mediante el cruce de Delta (Delta Flip).";
 				Name						= "DeltaFlip_AG";
-				Calculate					= Calculate.OnBarClose;
+				Calculate					= Calculate.OnBarClose; // Volvemos a OnBarClose, los ticks los manejaremos por serie paralela
 				IsOverlay					= true;
 				DisplayInDataBox			= true;
 				DrawOnPricePanel			= true;
@@ -48,7 +56,9 @@ namespace NinjaTrader.NinjaScript.Indicators
 				MinConsecutiveBars			= 3;
 				StarOffsetTicks				= 20;
 				MinBarRangeTicks			= 15;
-				MinDeltaThreshold			= 250;
+				MinDeltaThreshold			= 300; // Optimizado: Umbral de delta institucional
+				MinVolumeThreshold			= 600; // Optimizado: Volumen mínimo para NQ/MNQ
+				MinDeltaPercent				= 25.0; // Optimizado: 25% de desequilibrio (Alta Convicción)
 				BullishColor				= Brushes.Lime;
 				BearishColor				= Brushes.Red;
 				
@@ -56,6 +66,9 @@ namespace NinjaTrader.NinjaScript.Indicators
 				HTFInstrument				= null; // Al ser tipo Instrument, NT mostrará el selector oficial
 				HTFPeriodType				= BarsPeriodType.Minute;
 				HTFValue					= 2;
+
+				ExportToCSV					= false;
+				ExportFileName				= "DeltaFlip_Export.csv";
 			}
 			else if (State == State.Configure)
 			{
@@ -81,76 +94,119 @@ namespace NinjaTrader.NinjaScript.Indicators
 			}
 			else if (State == State.DataLoaded)
 			{
-				// Si no hay datos HTF, usamos la serie 0. De lo contrario la 2 (Serie 1 es Ticks)
-				int htfIndex = UseHTF ? 2 : 0;
-				
-				// IMPORTANTE: Para OrderFlow en series secundarias, es más estable usar BarsArray[index]
-				cumulativeDelta = OrderFlowCumulativeDelta(BarsArray[htfIndex], CumulativeDeltaType.BidAsk, CumulativeDeltaPeriod.Bar, 0);
-				
-				Print(string.Format("DeltaFlip_AG: Inicializado en {0}. Modo HTF: {1} (Index {2}).", 
-					Instrument.FullName, UseHTF, htfIndex));
+				barDelta = new Series<double>(this);
+				barMaxDelta = new Series<double>(this);
+				barMinDelta = new Series<double>(this);
+
+				Print(string.Format("DeltaFlip_AG: Inicializado en {0}. Modo HTF: {1}", 
+					Instrument.FullName, UseHTF));
 				
 				if (UseHTF)
 					Print(string.Format("DeltaFlip_AG: Objetivo HTF -> {0}.", 
 						HTFInstrument != null ? HTFInstrument.FullName : Instrument.FullName));
+
+				if (ExportToCSV)
+				{
+					string path = Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments);
+					filePath = Path.Combine(path, ExportFileName);
+					headerWritten = false; 
+					
+					try {
+						// Intentamos crear el archivo y escribir la cabecera
+						File.WriteAllText(filePath, "Time;Instrument;Open;High;Low;Close;Volume;Delta;MaxDelta;MinDelta;DeltaPercent" + Environment.NewLine);
+						headerWritten = true;
+						Print("DeltaFlip_AG: Archivo CSV listo en -> " + filePath);
+					} catch (Exception ex) {
+						Print("DeltaFlip_AG ERROR: No se pudo crear el archivo. Asegúrate de que no esté abierto en Excel: " + ex.Message);
+					}
+				}
 			}
+		}
+
+		protected override void OnMarketData(MarketDataEventArgs marketDataUpdate)
+		{
+			// Solo procesamos Trades (Last) para calcular el Delta
+			if (marketDataUpdate.MarketDataType != MarketDataType.Last) return;
+
+			// Determinamos si el tick es del instrumento correcto
+			bool isPrimary = marketDataUpdate.Instrument.FullName == Instrument.FullName;
+			bool isHTF = (HTFInstrument != null && marketDataUpdate.Instrument.FullName == HTFInstrument.FullName);
+			
+			if (UseHTF && !isHTF) return;
+			if (!UseHTF && !isPrimary) return;
+
+			// Cálculo de Delta según precio vs Bid/Ask en el momento del trade
+			double tickDelta = 0;
+			if (marketDataUpdate.Price >= marketDataUpdate.Ask)
+				tickDelta = marketDataUpdate.Volume;
+			else if (marketDataUpdate.Price <= marketDataUpdate.Bid)
+				tickDelta = -marketDataUpdate.Volume;
+
+			currentDelta += tickDelta;
+			currentMaxDelta = Math.Max(currentMaxDelta, currentDelta);
+			currentMinDelta = Math.Min(currentMinDelta, currentDelta);
 		}
 
 		protected override void OnBarUpdate()
 		{
-			// Si estamos en la serie de Ticks (BIP 1), no hacemos nada
-			if (BarsInProgress == 1) return;
-
-			// Diagnostic: Imprimir cada vez que cierra una vela si estamos en debug
-			// if (CurrentBar < 10) Print("BIP: " + BarsInProgress + " Bar: " + CurrentBar + " Delta: " + (cumulativeDelta != null ? cumulativeDelta.DeltaClose[0].ToString() : "null"));
-
-			// Determinamos en qué serie debemos procesar la lógica de cálculo
+			// targetBIP es 2 si usamos HTF, 0 si es el gráfico normal
 			int targetBIP = UseHTF ? 2 : 0;
 			
-			// Solo procesamos cuando la serie objetivo (Chart o HTF) tiene una nueva vela cerrada
+			// Solo actuamos cuando cierra una vela de la serie objetivo
 			if (BarsInProgress != targetBIP) return;
+			if (CurrentBar < MinConsecutiveBars + 1) return;
+
+			// En este punto, la vela acaba de CERRAR.
+			// Los valores de currentDelta, currentMaxDelta, etc. contienen lo acumulado en esta vela.
 			
-			if (CurrentBars[targetBIP] < MinConsecutiveBars + 1) return;
+			double lastDelta = currentDelta;
+			double lastVolume = Volumes[0][0]; // Volumen de la vela que cierra
+			double deltaPercent = lastVolume > 0 ? (Math.Abs(lastDelta) / lastVolume) * 100 : 0;
+			double barRangeTicks = (High[0] - Low[0]) / Instrument.MasterInstrument.TickSize;
 
-			// Obtenemos el delta de la vela correspondiente
-			double currentDelta = cumulativeDelta.DeltaClose[0];
-			
-			// Diagnostic para el usuario:
-			// Print(string.Format("Barra HTF #{0} cerrada. Delta: {1}", CurrentBars[targetBIP], currentDelta));
+			// Guardamos para uso interno y visual
+			barDelta[0] = lastDelta;
+			barMaxDelta[0] = currentMaxDelta;
+			barMinDelta[0] = currentMinDelta;
 
-			// Rango de vela de la serie objetivo (donde calculamos)
-			double barRangeTicks = (Highs[targetBIP][0] - Lows[targetBIP][0]) / BarsArray[targetBIP].Instrument.MasterInstrument.TickSize;
-
-			// Lógica de detección de señales de reversión
-			if (currentDelta > 0)
+			// --- LÓGICA DE SEÑALES ---
+			if (lastDelta > 0)
 			{
-				if (consecutiveNegative >= MinConsecutiveBars && barRangeTicks >= MinBarRangeTicks && currentDelta >= MinDeltaThreshold)
+				if (consecutiveNegative >= MinConsecutiveBars && barRangeTicks >= MinBarRangeTicks && lastDelta >= MinDeltaThreshold && lastVolume >= MinVolumeThreshold && deltaPercent >= MinDeltaPercent)
 				{
-					// Dibujamos en los Highs/Lows de la serie 0 (el gráfico que ve el usuario)
-					Draw.Diamond(this, "BullishFlip" + CurrentBars[targetBIP], true, 0, Lows[0][0] - (TickSize * StarOffsetTicks), BullishColor);
-					Print("DeltaFlip_AG: SEÑAL ALCISTA detectada en barra " + CurrentBars[targetBIP]);
+					Draw.Diamond(this, "BullishFlip" + CurrentBar, true, 0, Low[0] - (TickSize * StarOffsetTicks), BullishColor);
+					Print(string.Format("DeltaFlip_AG: SEÑAL + en {0}. Delta: {1}, Vol: {2}", Time[0], lastDelta, lastVolume));
 				}
-				
 				consecutivePositive++;
 				consecutiveNegative = 0;
 			}
-			else if (currentDelta < 0)
+			else if (lastDelta < 0)
 			{
-				if (consecutivePositive >= MinConsecutiveBars && barRangeTicks >= MinBarRangeTicks && Math.Abs(currentDelta) >= MinDeltaThreshold)
+				if (consecutivePositive >= MinConsecutiveBars && barRangeTicks >= MinBarRangeTicks && Math.Abs(lastDelta) >= MinDeltaThreshold && lastVolume >= MinVolumeThreshold && deltaPercent >= MinDeltaPercent)
 				{
-					Draw.Diamond(this, "BearishFlip" + CurrentBars[targetBIP], true, 0, Highs[0][0] + (TickSize * StarOffsetTicks), BearishColor);
-					Print("DeltaFlip_AG: SEÑAL BAJISTA detectada en barra " + CurrentBars[targetBIP]);
+					Draw.Diamond(this, "BearishFlip" + CurrentBar, true, 0, High[0] + (TickSize * StarOffsetTicks), BearishColor);
+					Print(string.Format("DeltaFlip_AG: SEÑAL - en {0}. Delta: {1}, Vol: {2}", Time[0], lastDelta, lastVolume));
 				}
-				
 				consecutiveNegative++;
 				consecutivePositive = 0;
 			}
-			else
+			else { consecutivePositive = 0; consecutiveNegative = 0; }
+
+			// --- EXPORTACIÓN AL CSV ---
+			if (ExportToCSV && headerWritten)
 			{
-				// Si el delta es exactamente 0, reseteamos conteo
-				consecutivePositive = 0;
-				consecutiveNegative = 0;
+				try {
+					string line = string.Format("{0};{1};{2};{3};{4};{5};{6};{7};{8};{9};{10:F2}",
+						Time[0].ToString("yyyy-MM-dd HH:mm:ss"), Instrument.FullName, Open[0], High[0], Low[0], Close[0],
+						lastVolume, lastDelta, currentMaxDelta, currentMinDelta, deltaPercent);
+					File.AppendAllText(filePath, line + Environment.NewLine);
+				} catch { /* Error silencioso si el archivo se bloquea momentáneamente */ }
 			}
+
+			// RESET para la siguiente vela que empieza ahora
+			currentDelta = 0;
+			currentMaxDelta = 0;
+			currentMinDelta = 0;
 		}
 
 		#region Properties
@@ -173,6 +229,16 @@ namespace NinjaTrader.NinjaScript.Indicators
 		[Range(0, 10000)]
 		[Display(Name="Min Delta Threshold", Description="Delta mínimo absoluto en la vela de señal para considerarla institucional", Order=4, GroupName="Parameters")]
 		public int MinDeltaThreshold { get; set; }
+
+		[NinjaScriptProperty]
+		[Range(0, 100000)]
+		[Display(Name="Min Volume Threshold", Description="Volumen total mínimo en la vela para validar la señal", Order=5, GroupName="Parameters")]
+		public int MinVolumeThreshold { get; set; }
+
+		[NinjaScriptProperty]
+		[Range(0, 100)]
+		[Display(Name="Min Delta %", Description="Porcentaje mínimo que debe representar el Delta sobre el Volumen total", Order=6, GroupName="Parameters")]
+		public double MinDeltaPercent { get; set; }
 
 		[NinjaScriptProperty]
 		[XmlIgnore]
@@ -220,6 +286,14 @@ namespace NinjaTrader.NinjaScript.Indicators
 			get { return Serialize.BrushToString(BearishColor); }
 			set { BearishColor = Serialize.StringToBrush(value); }
 		}
+
+		[NinjaScriptProperty]
+		[Display(Name="Export to CSV", Description="Habilita la grabación de datos en un archivo CSV para backtesting", Order=1, GroupName="Export Settings")]
+		public bool ExportToCSV { get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name="Export File Name", Description="Nombre del archivo (se guardará en Documentos)", Order=2, GroupName="Export Settings")]
+		public string ExportFileName { get; set; }
 		#endregion
 	}
 }

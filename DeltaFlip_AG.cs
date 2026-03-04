@@ -71,7 +71,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 				ExportFileName				= "DeltaFlip_Export.csv";
 				
 				UseAlerts					= true;
-				AlertSound					= @"/Users/pabloruiz/Documents/ORB_Strategy/DeltaFlip.wav";
+				AlertSound					= "DeltaFlip.wav";
 			}
 			else if (State == State.Configure)
 			{

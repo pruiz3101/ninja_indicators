@@ -10,6 +10,7 @@ using System.Windows;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Xml.Serialization;
+using System.IO;
 using NinjaTrader.Cbi;
 using NinjaTrader.Gui;
 using NinjaTrader.Gui.Chart;
@@ -41,6 +42,30 @@ namespace NinjaTrader.NinjaScript.Indicators
 		private double cumVolumePrice = 0;
 		private double cumVolume = 0;
 		private double currentVwapValue = 0;
+		
+		// VARIABLES PARA DATA LOGGING Y OPTIMIZACIÓN
+		private bool dataLoggedThisSession = false;
+		private bool trackingTrade = false;
+		private double tradeEntryPrice = 0;
+		private int tradeDirection = 0; // 1 Long, -1 Short
+		private double maxFavorableExcursion = 0;
+		private double maxAdverseExcursion = 0;
+		private int barsSinceEntry = 0;
+		private string logPath;
+		
+		private struct SignalData
+		{
+			public DateTime Time;
+			public string Direction;
+			public double ORRangeTicks;
+			public double VolRatio;
+			public double ADX;
+			public double EMASlope;
+			public double VWAPDist;
+			public double BodyRatio;
+			public double TrendEMA;
+		}
+		private SignalData currentSignal;
 
 		protected override void OnStateChange()
 		{
@@ -61,7 +86,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 				MaxSessionStartTime			= 235959; 
 				
 				// VOLUME BREAKOUT
-				VolMultiplier				= 1.5;
+				VolMultiplier				= 3.5;
 				VolLookback					= 20;
 				EnableVolDiamonds			= true;
 				
@@ -69,13 +94,14 @@ namespace NinjaTrader.NinjaScript.Indicators
 				UseVWAPFilter				= true;
 
 				// ADX FILTER
-				UseADXFilter				= false; // Desactivado por defecto (mucho lag)
-				ADXThreshold				= 20;
+				UseADXFilter				= true; 
+				ADXThreshold				= 25;
 				ADXPeriod					= 14;
 
-				// EMA SLOPE FILTER (Más reactivo para MNQ)
+				// EMA SLOPE FILTER
 				UseEMASlopeFilter			= true;
 				EMAPeriod					= 9;
+				EMASlopeThreshold           = 18.0;
 				
 				// ESTÉTICA
 				ORHighColor					= Brushes.Lime;
@@ -94,6 +120,10 @@ namespace NinjaTrader.NinjaScript.Indicators
 				MinBodyRatio                = 0.6;
 				UseTrendConfirmationFilter  = true;
 				EMAPeriod2                  = 21;
+				
+				// OPTIMIZACIÓN
+				EnableDataLog               = false;
+				LogFileName                 = "ORB_Data_Log";
 			}
 			else if (State == State.DataLoaded)
 			{
@@ -102,6 +132,12 @@ namespace NinjaTrader.NinjaScript.Indicators
 				adx = ADX(ADXPeriod);
 				ema = EMA(EMAPeriod);
 				ema2 = EMA(EMAPeriod2);
+				logPath = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.MyDocuments), LogFileName + ".csv");
+				
+				if (EnableDataLog && !File.Exists(logPath))
+				{
+					File.WriteAllText(logPath, "Time;Direction;OR_Ticks;VolRatio;ADX;EMASlope;VWAPDist;BodyRatio;TrendEMA;MFE_Ticks;MAE_Ticks;Result\n");
+				}
 			}
 		}
 
@@ -110,6 +146,35 @@ namespace NinjaTrader.NinjaScript.Indicators
 			if (CurrentBar < Math.Max(VolLookback, Math.Max(ADXPeriod, EMAPeriod))) return;
 			
 			volSeries[0] = (double)Volume[0];
+			
+			// SEGUIMIENTO DE TRADE ACTIVO (Para MFE/MAE)
+			if (trackingTrade)
+			{
+				barsSinceEntry++;
+				double currentProfit = 0;
+				double currentLoss = 0;
+				
+				if (tradeDirection == 1) // Long
+				{
+					currentProfit = High[0] - tradeEntryPrice;
+					currentLoss = tradeEntryPrice - Low[0];
+				}
+				else // Short
+				{
+					currentProfit = tradeEntryPrice - Low[0];
+					currentLoss = High[0] - tradeEntryPrice;
+				}
+				
+				maxFavorableExcursion = Math.Max(maxFavorableExcursion, currentProfit);
+				maxAdverseExcursion = Math.Max(maxAdverseExcursion, currentLoss);
+				
+				// Cerrar tracking al final de sesión o tras X barras (ej 50 barras = ~4 horas en 5min)
+				if (Bars.IsLastBarOfSession || barsSinceEntry >= 50)
+				{
+					LogTradeResult();
+					trackingTrade = false;
+				}
+			}
 
 			// DETECTAR NUEVA SESIÓN Y RESETEAR ACUMULADORES VWAP
 			if (Bars.IsFirstBarOfSession)
@@ -129,6 +194,8 @@ namespace NinjaTrader.NinjaScript.Indicators
 					isRthSession = (sessionHhmmss >= MinSessionStartTime && sessionHhmmss <= MaxSessionStartTime);
 				else 
 					isRthSession = true;
+					
+				dataLoggedThisSession = false;
 			}
 
 			// CÁLCULO VWAP MANUAL
@@ -141,28 +208,34 @@ namespace NinjaTrader.NinjaScript.Indicators
 
 			if (!isRthSession) return;
 
-			DateTime orStart = Time[0].Date.AddHours(ORStartTime / 10000).AddMinutes((ORStartTime / 100) % 100);
+			// CÁLCULO DE VENTANA OR RELATIVA A LA SESIÓN
+			DateTime orStart = currentSessionStart.Date.AddHours(ORStartTime / 10000).AddMinutes((ORStartTime / 100) % 100);
+			if (orStart < currentSessionStart) orStart = orStart.AddDays(1);
 			DateTime orEnd = orStart.AddMinutes(ORDurationMinutes);
 
-			// CAPTURA RANGO
-			if (Time[0] > orStart && Time[0] < orEnd)
+			// CAPTURA RANGO (Estrictamente después de orStart)
+			if (Time[0] > orStart && Time[0] <= orEnd)
 			{
 				orHigh = Math.Max(orHigh, High[0]);
 				orLow = Math.Min(orLow, Low[0]);
 
 				if (EnableORCountdown)
 				{
-					// Calculamos el inicio de la barra actual para un countdown preciso
 					DateTime barStartTime = (State == State.Realtime) ? DateTime.Now : Time[0].AddMinutes(-Bars.BarsPeriod.Value);
 					TimeSpan remaining = orEnd - barStartTime;
 					
-					if (remaining.Ticks < 0) remaining = TimeSpan.Zero;
-					
-					string timerText = string.Format("OR ESTABLECIENDO: {0:mm\\:ss}", remaining);
-					Draw.Text(this, "ORTimer", timerText, 0, orHigh + TickSize * 5, ORCountdownColor);
+					if (remaining.TotalSeconds > 0)
+					{
+						string timerText = string.Format("OR ESTABLECIENDO: {0:mm\\:ss}", remaining);
+						Draw.Text(this, "ORTimer", timerText, 0, orHigh + TickSize * 5, ORCountdownColor);
+					}
+					else 
+					{
+						RemoveDrawObject("ORTimer");
+					}
 				}
 			}
-			else
+			else if (Time[0] > orEnd)
 			{
 				if (EnableORCountdown) RemoveDrawObject("ORTimer");
 			}
@@ -189,15 +262,12 @@ namespace NinjaTrader.NinjaScript.Indicators
 
 					if (Volume[0] > (avgVol * VolMultiplier))
 					{
-						// FILTROS
 						bool vwapFilterUp   = !UseVWAPFilter || (Close[0] > currentVwapValue);
 						bool vwapFilterDown = !UseVWAPFilter || (Close[0] < currentVwapValue);
 						bool adxFilter      = !UseADXFilter  || (adx[0] > ADXThreshold);
-						
-						bool emaSlopeUp     = !UseEMASlopeFilter || (ema[0] > ema[1]);
-						bool emaSlopeDown   = !UseEMASlopeFilter || (ema[0] < ema[1]);
+						bool emaSlopeUp     = !UseEMASlopeFilter || ((ema[0] - ema[1]) > EMASlopeThreshold);
+						bool emaSlopeDown   = !UseEMASlopeFilter || ((ema[1] - ema[0]) > EMASlopeThreshold);
 
-						// NUEVOS FILTROS
 						double bodySize     = Math.Abs(Close[0] - Open[0]);
 						double candleRange  = High[0] - Low[0];
 						bool candleQuality  = !UseCandleQualityFilter || (candleRange > 0 && (bodySize / candleRange) >= MinBodyRatio);
@@ -212,6 +282,31 @@ namespace NinjaTrader.NinjaScript.Indicators
 						{
 							Draw.Diamond(this, "D"+CurrentBar, true, 0, High[0] + TickSize*10, Brushes.Red);
 						}
+						
+						// LOGICA DE CAPTURA DE DATOS PARA OPTIMIZACIÓN
+						if (EnableDataLog && !dataLoggedThisSession && ((Close[0] > orHigh && Close[1] <= orHigh) || (Close[0] < orLow && Close[1] >= orLow)))
+						{
+							currentSignal = new SignalData
+							{
+								Time = Time[0],
+								Direction = Close[0] > orHigh ? "Long" : "Short",
+								ORRangeTicks = (orHigh - orLow) / TickSize,
+								VolRatio = Volume[0] / avgVol,
+								ADX = adx[0],
+								EMASlope = ema[0] - ema[1],
+								VWAPDist = (Close[0] - currentVwapValue) / TickSize,
+								BodyRatio = candleRange > 0 ? (bodySize / candleRange) : 0,
+								TrendEMA = (Close[0] - ema2[0]) / TickSize
+							};
+							
+							trackingTrade = true;
+							tradeEntryPrice = Close[0];
+							tradeDirection = Close[0] > orHigh ? 1 : -1;
+							maxFavorableExcursion = 0;
+							maxAdverseExcursion = 0;
+							barsSinceEntry = 0;
+							dataLoggedThisSession = true;
+						}
 					}
 				}
 
@@ -223,6 +318,34 @@ namespace NinjaTrader.NinjaScript.Indicators
 			}
 		}
 
+		private void LogTradeResult()
+		{
+			if (!EnableDataLog) return;
+			
+			string result = maxFavorableExcursion > (currentSignal.ORRangeTicks * TickSize * 2) ? "Win" : "Loss";
+			
+			string line = string.Format("{0};{1};{2:F0};{3:F2};{4:F2};{5:F4};{6:F0};{7:F2};{8:F0};{9:F0};{10:F0};{11}\n",
+				currentSignal.Time,
+				currentSignal.Direction,
+				currentSignal.ORRangeTicks,
+				currentSignal.VolRatio,
+				currentSignal.ADX,
+				currentSignal.EMASlope,
+				currentSignal.VWAPDist,
+				currentSignal.BodyRatio,
+				currentSignal.TrendEMA,
+				maxFavorableExcursion / TickSize,
+				maxAdverseExcursion / TickSize,
+				result
+			);
+			
+			try {
+				File.AppendAllText(logPath, line);
+			} catch {
+				// Silently fail if file is locked
+			}
+		}
+
 		#region Properties
 		[NinjaScriptProperty] [Display(Name="OR Start (HHMMSS)", GroupName="1. Config")] public int ORStartTime { get; set; }
 		[NinjaScriptProperty] [Display(Name="OR Duration (min)", GroupName="1. Config")] public int ORDurationMinutes { get; set; }
@@ -231,6 +354,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 		[NinjaScriptProperty] [Display(Name="Use ADX Filter", GroupName="2. Filters")] public bool UseADXFilter { get; set; }
 		[NinjaScriptProperty] [Display(Name="Use EMA Slope Filter", GroupName="2. Filters")] public bool UseEMASlopeFilter { get; set; }
 		[NinjaScriptProperty] [Range(1, 100)] [Display(Name="EMAPeriod (Slope)", GroupName="2. Filters")] public int EMAPeriod { get; set; }
+		[NinjaScriptProperty] [Range(0, 100)] [Display(Name="EMA Slope Threshold", GroupName="2. Filters")] public double EMASlopeThreshold { get; set; }
 		[NinjaScriptProperty] [Range(1, 100)] [Display(Name="ADX Threshold", GroupName="2. Filters")] public int ADXThreshold { get; set; }
 		[NinjaScriptProperty] [Range(1, 50)] [Display(Name="ADX Period", GroupName="2. Filters")] public int ADXPeriod { get; set; }
 
@@ -261,6 +385,9 @@ namespace NinjaTrader.NinjaScript.Indicators
 		[NinjaScriptProperty] [Range(0.1, 1.0)] [Display(Name="Min Body Ratio", GroupName="7. Breakout Confirmation")] public double MinBodyRatio { get; set; }
 		[NinjaScriptProperty] [Display(Name="Use Trend Confirmation (EMA 21)", GroupName="7. Breakout Confirmation")] public bool UseTrendConfirmationFilter { get; set; }
 		[NinjaScriptProperty] [Range(1, 200)] [Display(Name="EMA Period 2", GroupName="7. Breakout Confirmation")] public int EMAPeriod2 { get; set; }
+		
+		[NinjaScriptProperty] [Display(Name="Enable Data Log", GroupName="8. Optimization")] public bool EnableDataLog { get; set; }
+		[NinjaScriptProperty] [Display(Name="Log FileName", GroupName="8. Optimization")] public string LogFileName { get; set; }
 		#endregion
 	}
 }

@@ -69,6 +69,9 @@ namespace NinjaTrader.NinjaScript.Indicators
 
 				ExportToCSV					= false;
 				ExportFileName				= "DeltaFlip_Export.csv";
+				
+				UseAlerts					= true;
+				AlertSound					= @"/Users/pabloruiz/Documents/ORB_Strategy/DeltaFlip.wav";
 			}
 			else if (State == State.Configure)
 			{
@@ -176,6 +179,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 				{
 					Draw.Diamond(this, "BullishFlip" + CurrentBar, true, 0, Low[0] - (TickSize * StarOffsetTicks), BullishColor);
 					Print(string.Format("DeltaFlip_AG: SEÑAL + en {0}. Delta: {1}, Vol: {2}", Time[0], lastDelta, lastVolume));
+					if (UseAlerts && State == State.Realtime) PlaySound(AlertSound);
 				}
 				consecutivePositive++;
 				consecutiveNegative = 0;
@@ -186,6 +190,7 @@ namespace NinjaTrader.NinjaScript.Indicators
 				{
 					Draw.Diamond(this, "BearishFlip" + CurrentBar, true, 0, High[0] + (TickSize * StarOffsetTicks), BearishColor);
 					Print(string.Format("DeltaFlip_AG: SEÑAL - en {0}. Delta: {1}, Vol: {2}", Time[0], lastDelta, lastVolume));
+					if (UseAlerts && State == State.Realtime) PlaySound(AlertSound);
 				}
 				consecutiveNegative++;
 				consecutivePositive = 0;
@@ -294,6 +299,14 @@ namespace NinjaTrader.NinjaScript.Indicators
 		[NinjaScriptProperty]
 		[Display(Name="Export File Name", Description="Nombre del archivo (se guardará en Documentos)", Order=2, GroupName="Export Settings")]
 		public string ExportFileName { get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name="Use Audio Alerts", Description="Habilita el sonido cuando aparece un diamante", Order=1, GroupName="Alerts")]
+		public bool UseAlerts { get; set; }
+
+		[NinjaScriptProperty]
+		[Display(Name="Alert Sound File", Description="Ruta completa al archivo .wav", Order=2, GroupName="Alerts")]
+		public string AlertSound { get; set; }
 		#endregion
 	}
 }

@@ -72,20 +72,48 @@ namespace NinjaTrader.NinjaScript.AddOns
     {
         private TextBlock countLabel;
         private TextBlock statusLabel;
+        private TextBlock phraseLabel;
         private ComboBox accountSelector;
         private Account selectedAccount;
         private System.Windows.Threading.DispatcherTimer fallbackTimer;
+        private System.Windows.Threading.DispatcherTimer phraseTimer;
+        private int currentPhraseIndex = 0;
+
+        private readonly List<string> phrases = new List<string>
+        {
+            "Respeta tu plan de trading a rajatabla.",
+            "La paciencia paga. Espera tu setup perfecto.",
+            "Gestiona tu riesgo, el mercado es impredecible.",
+            "No persigas el precio, deja que venga a ti.",
+            "Un stop loss es tu salvavidas, no tu enemigo.",
+            "El trading es un maratón, no un sprint.",
+            "Protege tu capital primero, busca ganancias después.",
+            "Acepta la pérdida rápidamente y sigue adelante.",
+            "Opera lo que ves, no lo que crees.",
+            "Menos es más. Selecciona solo las mejores oportunidades.",
+            "La disciplina es el puente entre tus metas y el éxito.",
+            "Mantén la calma y confía en tu estrategia.",
+            "Tu única competencia en el mercado eres tú mismo.",
+            "Deja correr tus ganancias y corta tus pérdidas.",
+            "El mercado estará aquí mañana, no fuerces un trade.",
+            "Celebra tus buenas decisiones, no solo los resultados.",
+            "Conoce cuándo no operar, quedarse fuera es una posición.",
+            "Un buen trade perdedor es aquel que siguió el plan.",
+            "Mantén tus emociones fuera de la pantalla.",
+            "Consistencia antes que rentabilidad."
+        };
 
         public DailyTradeCounterWindow()
         {
             Caption = "Trade Counter Pro";
-            Width = 280;
-            Height = 250;
+            Width = 300;
+            Height = 350;
             Topmost = true;
 
             Grid mainGrid = new Grid { Background = new SolidColorBrush(Color.FromRgb(20, 20, 20)) };
             mainGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); // Selector
             mainGrid.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) }); // Count
+            mainGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); // Phrase
             mainGrid.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto }); // Footer/Status
 
             // 1. TOP: Account Selector
@@ -122,14 +150,33 @@ namespace NinjaTrader.NinjaScript.AddOns
                 Background = Brushes.DimGray,
                 Foreground = Brushes.White
             };
-            refreshBtn.Click += (s, e) => RefreshCount();
+            refreshBtn.Click += (s, e) => {
+                RefreshCount();
+                RotatePhrase();
+            };
 
             centerPanel.Children.Add(countLabel);
             centerPanel.Children.Add(refreshBtn);
             Grid.SetRow(centerPanel, 1);
             mainGrid.Children.Add(centerPanel);
 
-            // 3. FOOTER: Status
+            // 3. PHRASE PANEL
+            Random rConfig = new Random();
+            currentPhraseIndex = rConfig.Next(phrases.Count);
+            phraseLabel = new TextBlock {
+                Text = "\"" + phrases[currentPhraseIndex] + "\"",
+                Foreground = Brushes.Gold,
+                FontSize = 13,
+                FontStyle = FontStyles.Italic,
+                TextWrapping = TextWrapping.Wrap,
+                TextAlignment = TextAlignment.Center,
+                Margin = new Thickness(15, 10, 15, 20),
+                HorizontalAlignment = HorizontalAlignment.Center
+            };
+            Grid.SetRow(phraseLabel, 2);
+            mainGrid.Children.Add(phraseLabel);
+
+            // 4. FOOTER: Status
             statusLabel = new TextBlock { 
                 Text = "Listo", 
                 Foreground = Brushes.DarkGray, 
@@ -137,23 +184,43 @@ namespace NinjaTrader.NinjaScript.AddOns
                 Margin = new Thickness(5),
                 HorizontalAlignment = HorizontalAlignment.Right 
             };
-            Grid.SetRow(statusLabel, 2);
+            Grid.SetRow(statusLabel, 3);
             mainGrid.Children.Add(statusLabel);
 
             Content = mainGrid;
 
-            // Timer de seguridad (cada 5 seg)
+            // Timer de seguridad para el conteo de trades (cada 5 seg)
             fallbackTimer = new System.Windows.Threading.DispatcherTimer();
             fallbackTimer.Interval = TimeSpan.FromSeconds(5);
             fallbackTimer.Tick += (s, e) => RefreshCount();
             fallbackTimer.Start();
+
+            // Timer para las frases motivadoras (cada 5 minutos)
+            phraseTimer = new System.Windows.Threading.DispatcherTimer();
+            phraseTimer.Interval = TimeSpan.FromMinutes(5);
+            phraseTimer.Tick += (s, e) => RotatePhrase();
+            phraseTimer.Start();
 
             UpdateSelectedAccount();
             
             this.Closed += (s, e) => {
                 if (selectedAccount != null) selectedAccount.ExecutionUpdate -= OnExecutionUpdate;
                 if (fallbackTimer != null) fallbackTimer.Stop();
+                if (phraseTimer != null) phraseTimer.Stop();
             };
+        }
+
+        private void RotatePhrase()
+        {
+            Random r = new Random();
+            int newIndex;
+            do {
+                newIndex = r.Next(phrases.Count);
+            } while (newIndex == currentPhraseIndex && phrases.Count > 1);
+            currentPhraseIndex = newIndex;
+            
+            if (phraseLabel != null)
+                phraseLabel.Text = "\"" + phrases[currentPhraseIndex] + "\"";
         }
 
         private void UpdateSelectedAccount()
@@ -200,29 +267,58 @@ namespace NinjaTrader.NinjaScript.AddOns
                     var execsList = execsProp.GetValue(selectedAccount) as System.Collections.IEnumerable;
                     if (execsList != null)
                     {
+                        // Usamos un HashSet para recordar los OrderId que ya hemos contado hoy
+                        HashSet<string> countedOrders = new HashSet<string>();
+
                         foreach (object execObj in execsList)
                         {
                             if (execObj == null) continue;
 
                             var timeProp = execObj.GetType().GetProperty("Time");
                             var nameProp = execObj.GetType().GetProperty("Name");
+                            var orderProp = execObj.GetType().GetProperty("Order");
                             
-                            if (timeProp != null && nameProp != null)
+                            if (timeProp != null && nameProp != null && orderProp != null)
                             {
                                 DateTime execTime = (DateTime)timeProp.GetValue(execObj);
                                 string name = nameProp.GetValue(execObj).ToString();
                                 
                                 if (execTime >= today)
                                 {
-                                    lastExecName = name; // Guardamos para debug
+                                    object orderObj = orderProp.GetValue(execObj);
+                                    string orderId = "";
+                                    if (orderObj != null)
+                                    {
+                                        var orderIdProp = orderObj.GetType().GetProperty("OrderId");
+                                        if (orderIdProp != null)
+                                        {
+                                            orderId = orderIdProp.GetValue(orderObj)?.ToString() ?? "";
+                                        }
+                                    }
+
                                     string nLower = name.ToLower();
 
-                                    // Filtro expandido: Buscamos cualquier indicio de cierre
-                                    // En ATM suele ser "Profit target" o "Stop loss"
+                                    // Filtro para contabilizar solo las ejecuciones que cierran un trade
                                     if (nLower.Contains("exit") || nLower.Contains("target") || 
-                                        nLower.Contains("stop") || nLower.Contains("close") || nLower.Contains("cerrar"))
+                                        nLower.Contains("stop") || nLower.Contains("close") || 
+                                        nLower.Contains("cerrar") || nLower.Contains("rev"))
                                     {
-                                        count++;
+                                        lastExecName = name; // Guardamos para debug
+
+                                        // Si la orden tiene un ID y no lo hemos contado antes, sumamos 1
+                                        if (!string.IsNullOrEmpty(orderId))
+                                        {
+                                            if (!countedOrders.Contains(orderId))
+                                            {
+                                                countedOrders.Add(orderId);
+                                                count++;
+                                            }
+                                        }
+                                        else
+                                        {
+                                            // Fallback por si no se pudiera obtener el OrderId (muy raro)
+                                            count++;
+                                        }
                                     }
                                 }
                             }
@@ -231,7 +327,6 @@ namespace NinjaTrader.NinjaScript.AddOns
                 }
                 
                 countLabel.Text = count.ToString();
-                // Mostramos el nombre de la última ejecución para saber qué detecta NT8
                 statusLabel.Text = string.Format("Last: {0} | {1}", 
                     lastExecName.Length > 10 ? lastExecName.Substring(0, 10) : lastExecName, 
                     DateTime.Now.ToString("HH:mm:ss"));
